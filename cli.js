@@ -54,7 +54,8 @@ function runAgentMode() {
   process.stdin.resume();
   process.stdin.on('data', (chunk) => {
     buf += chunk;
-    const lines = buf.split(/\r?\n|\r/);
+    // Split on real newlines AND literal \n (two chars: backslash + n) that LLMs send
+    const lines = buf.split(/\r?\n|\r|\\n/);
     buf = lines.pop() || '';
     for (const l of lines) {
       const t = l.trim(); if (!t) continue;
