@@ -1,12 +1,10 @@
 #!/usr/bin/env node
 /**
  * Agent-friendly chatroom client.
- * Plain text output, works with PTY submit for agent interaction.
- * 
- * Usage: node agent-cli.js <room> --name <name> [--server ws://localhost:4000]
+ * Works with both process(write) and process(submit) from OpenClaw.
+ * Plain text output, no ANSI, no cursor manipulation.
  */
 
-const readline = require('readline');
 const WebSocket = require('ws');
 
 const args = process.argv.slice(2);
@@ -25,7 +23,7 @@ for (let i = 0; i < args.length; i++) {
 }
 
 if (!roomId) {
-  console.error('Usage: node agent-cli.js <room-id> --name <name> [--server <url>]');
+  process.stderr.write('Usage: node agent-cli.js <room-id> --name <name> [--server <url>]\n');
   process.exit(1);
 }
 
@@ -34,12 +32,6 @@ if (!userName) {
 }
 
 const ws = new WebSocket(serverUrl);
-
-// Use readline with terminal:true so PTY submit works
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-});
 
 ws.on('open', () => {
   ws.send(JSON.stringify({ type: 'join', room: roomId, name: userName }));
@@ -53,27 +45,22 @@ ws.on('message', (raw) => {
     return;
   }
 
-  // Use process.stdout.write to avoid readline interference
-  let line = '';
   switch (msg.type) {
     case 'joined':
-      line = `[JOINED] room=${msg.room} name=${msg.you.name} members=${msg.members.map(m => m.name).join(',')}`;
+      process.stdout.write(`[JOINED] room=${msg.room} name=${msg.you.name} members=${msg.members.map(m => m.name).join(',')}\n`);
       break;
     case 'msg':
-      line = `[MSG] ${msg.from}: ${msg.text}`;
+      process.stdout.write(`[MSG] ${msg.from}: ${msg.text}\n`);
       break;
     case 'system':
-      line = `[SYS] ${msg.text}`;
+      process.stdout.write(`[SYS] ${msg.text}\n`);
       break;
     case 'members':
-      line = `[MEMBERS] ${msg.members.map(m => m.name).join(', ')}`;
+      process.stdout.write(`[MEMBERS] ${msg.members.map(m => m.name).join(', ')}\n`);
       break;
     case 'error':
-      line = `[ERROR] ${msg.text}`;
+      process.stdout.write(`[ERROR] ${msg.text}\n`);
       break;
-  }
-  if (line) {
-    process.stdout.write('\r\x1b[K' + line + '\n');
   }
 });
 
@@ -83,23 +70,32 @@ ws.on('close', () => {
 });
 
 ws.on('error', (err) => {
-  console.error(`[ERROR] ${err.message}`);
+  process.stderr.write(`[ERROR] ${err.message}\n`);
   process.exit(1);
 });
 
-rl.on('line', (line) => {
-  const text = line.trim();
-  if (!text) return;
+// Handle stdin manually — split on any newline/CR combo
+// This works with both process(write, data="msg\n") and process(submit, data="msg")
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.resume();
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  // Split on \n, \r\n, or \r
+  const lines = buffer.split(/\r?\n|\r/);
+  // Last element is incomplete (no terminator yet) — keep in buffer
+  buffer = lines.pop() || '';
+  
+  for (const line of lines) {
+    const text = line.trim();
+    if (!text) continue;
 
-  if (text === '/who') {
-    ws.send(JSON.stringify({ type: 'who' }));
-  } else if (text === '/quit' || text === '/exit') {
-    ws.close();
-  } else {
-    ws.send(JSON.stringify({ type: 'msg', text }));
+    if (text === '/who') {
+      ws.send(JSON.stringify({ type: 'who' }));
+    } else if (text === '/quit' || text === '/exit') {
+      ws.close();
+    } else {
+      ws.send(JSON.stringify({ type: 'msg', text }));
+    }
   }
-});
-
-rl.on('close', () => {
-  ws.close();
 });
