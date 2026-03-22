@@ -2,14 +2,10 @@
 /**
  * Chatroom CLI — unified for humans and agents
  * 
- * Human mode (default, TTY detected):
- *   Raw ANSI TUI — header, scrollable messages, input line
- * 
- * Agent mode (--agent or no TTY):
- *   Plain text [MSG]/[SYS]/[JOINED] output
+ * Human mode (default, TTY):  Pastel TUI with rounded borders
+ * Agent mode (--agent/no TTY): Plain text [MSG]/[SYS] output
  */
 
-const readline = require('readline');
 const WebSocket = require('ws');
 
 const args = process.argv.slice(2);
@@ -31,16 +27,14 @@ if (!roomId) {
 }
 if (!userName) userName = `user-${Math.random().toString(36).slice(2, 8)}`;
 
-if (!process.stdin.isTTY || agentMode) {
-  runAgentMode();
-} else {
-  runHumanMode();
-}
+if (!process.stdin.isTTY || agentMode) runAgentMode();
+else runHumanMode();
 
-// ─── AGENT MODE ──────────────────────────────────
+// ═══════════════════════════════════════════════════════
+//  AGENT MODE
+// ═══════════════════════════════════════════════════════
 function runAgentMode() {
   const ws = new WebSocket(serverUrl);
-
   ws.on('open', () => ws.send(JSON.stringify({ type: 'join', room: roomId, name: userName })));
   ws.on('message', (raw) => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
@@ -63,8 +57,7 @@ function runAgentMode() {
     const lines = buf.split(/\r?\n|\r/);
     buf = lines.pop() || '';
     for (const l of lines) {
-      const t = l.trim();
-      if (!t) continue;
+      const t = l.trim(); if (!t) continue;
       if (t === '/who') ws.send(JSON.stringify({ type: 'who' }));
       else if (t === '/quit') ws.close();
       else ws.send(JSON.stringify({ type: 'msg', text: t }));
@@ -72,31 +65,63 @@ function runAgentMode() {
   });
 }
 
-// ─── HUMAN MODE (raw ANSI TUI) ──────────────────
+// ═══════════════════════════════════════════════════════
+//  HUMAN MODE — Pastel TUI
+// ═══════════════════════════════════════════════════════
 function runHumanMode() {
   const ws = new WebSocket(serverUrl);
 
   let myId = null;
   let members = [];
-  let messages = [];
+  let messages = [];     // { raw: string (with ANSI) }
   let inputText = '';
   let cursorPos = 0;
-  const MAX_MESSAGES = 500;
+  let scrollOffset = 0;  // 0 = bottom (latest)
+  const MAX_MESSAGES = 1000;
 
-  // Colors
-  const C = {
-    reset: '\x1b[0m',
-    bold: '\x1b[1m',
-    dim: '\x1b[2m',
-    cyan: '\x1b[36m',
-    green: '\x1b[32m',
-    yellow: '\x1b[33m',
-    red: '\x1b[31m',
-    gray: '\x1b[90m',
-    white: '\x1b[37m',
-    bgBlack: '\x1b[40m',
-    cyanBg: '\x1b[46m',
+  // ── Pastel palette (256-color) ──
+  // \x1b[38;5;Nm = foreground, \x1b[48;5;Nm = background
+  const P = {
+    reset:    '\x1b[0m',
+    bold:     '\x1b[1m',
+    dim:      '\x1b[2m',
+    italic:   '\x1b[3m',
+    // Pastel foregrounds
+    pink:     '\x1b[38;5;218m',    // soft pink
+    lavender: '\x1b[38;5;183m',    // lavender
+    mint:     '\x1b[38;5;158m',    // mint green
+    sky:      '\x1b[38;5;117m',    // sky blue
+    peach:    '\x1b[38;5;216m',    // peach
+    lilac:    '\x1b[38;5;141m',    // lilac purple
+    cream:    '\x1b[38;5;230m',    // cream/warm white
+    coral:    '\x1b[38;5;210m',    // coral
+    sage:     '\x1b[38;5;151m',    // sage
+    muted:    '\x1b[38;5;245m',    // muted gray
+    white:    '\x1b[38;5;255m',    // bright white
+    softRed:  '\x1b[38;5;174m',    // soft red
+    // Backgrounds
+    bgDark:   '\x1b[48;5;236m',   // dark charcoal bg
+    bgHeader: '\x1b[48;5;237m',   // slightly lighter header
+    bgInput:  '\x1b[48;5;235m',   // input area
+    bgAccent: '\x1b[48;5;238m',   // accent stripe
   };
+
+  // Rounded box drawing chars
+  const B = {
+    tl: '╭', tr: '╮', bl: '╰', br: '╯',
+    h: '─', v: '│',
+    dot: '●', diamond: '◆', arrow: '›',
+  };
+
+  // Assign persistent colors to usernames
+  const nameColors = [P.pink, P.sky, P.mint, P.peach, P.lilac, P.coral, P.sage, P.lavender];
+  const colorMap = new Map();
+  function getNameColor(name) {
+    if (!colorMap.has(name)) {
+      colorMap.set(name, nameColors[colorMap.size % nameColors.length]);
+    }
+    return colorMap.get(name);
+  }
 
   function getSize() {
     return { cols: process.stdout.columns || 80, rows: process.stdout.rows || 24 };
@@ -107,63 +132,100 @@ function runHumanMode() {
     return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
   }
 
-  function truncate(str, max) {
-    return str.length > max ? str.slice(0, max - 1) + '…' : str;
+  // Strip ANSI for length calculation
+  function stripAnsi(str) {
+    return str.replace(/\x1b\[[0-9;]*m/g, '');
   }
 
-  function clearScreen() {
-    process.stdout.write('\x1b[2J\x1b[H');
+  function padRight(str, len) {
+    const visible = stripAnsi(str).length;
+    return visible < len ? str + ' '.repeat(len - visible) : str;
   }
 
   function moveTo(row, col) {
     process.stdout.write(`\x1b[${row};${col}H`);
   }
 
-  function drawHorizontalLine(row, cols, char = '─') {
-    moveTo(row, 1);
-    process.stdout.write(C.gray + char.repeat(cols) + C.reset);
-  }
-
   function render() {
     const { cols, rows } = getSize();
-    const headerHeight = 2;   // room info + member line
-    const inputHeight = 2;    // separator + input line  
-    const msgHeight = rows - headerHeight - inputHeight;
 
-    // Hide cursor during render
-    process.stdout.write('\x1b[?25l');
-    clearScreen();
+    // Layout: header(3) + messages(flex) + input(3)
+    const headerH = 3;
+    const inputH = 3;
+    const msgH = Math.max(1, rows - headerH - inputH);
 
-    // ── Header ──
-    const roomStr = `#${roomId}`;
-    const onlineStr = `${members.length} online`;
-    const headerLine = ` ${C.bold}${C.cyan}${roomStr}${C.reset}  ${C.gray}│${C.reset}  ${C.green}${onlineStr}${C.reset}`;
-    moveTo(1, 1);
-    process.stdout.write(headerLine);
+    process.stdout.write('\x1b[?25l'); // hide cursor
+    process.stdout.write('\x1b[2J\x1b[H'); // clear
 
-    // Member list
-    const memberStr = ' ' + truncate(members.map(m => m.name).join(', '), cols - 2);
-    moveTo(2, 1);
-    process.stdout.write(C.gray + memberStr + C.reset);
-
-    drawHorizontalLine(3, cols);
-
-    // ── Messages ──
-    const visibleMsgs = messages.slice(-msgHeight);
-    for (let i = 0; i < visibleMsgs.length; i++) {
-      moveTo(4 + i, 1);
-      process.stdout.write(' ' + truncate(visibleMsgs[i], cols - 2));
+    // Fill entire screen with dark bg
+    for (let r = 1; r <= rows; r++) {
+      moveTo(r, 1);
+      process.stdout.write(P.bgDark + ' '.repeat(cols) + P.reset);
     }
 
-    // ── Input ──
-    drawHorizontalLine(rows - 1, cols);
-    moveTo(rows, 1);
-    const prompt = ` ${C.green}>${C.reset} `;
-    const inputDisplay = truncate(inputText, cols - 4);
-    process.stdout.write(prompt + inputDisplay);
+    // ── HEADER ──
+    // Top border
+    moveTo(1, 1);
+    process.stdout.write(P.bgDark + P.muted + B.tl + B.h.repeat(cols - 2) + B.tr + P.reset);
 
-    // Show cursor at input position
-    moveTo(rows, 4 + cursorPos);
+    // Room info line
+    moveTo(2, 1);
+    const onlineCount = members.length;
+    const dots = members.map(m => {
+      const c = m.id === myId ? P.mint : P.sky;
+      return `${c}${B.dot}${P.reset}`;
+    }).join(' ');
+    const roomLine = ` ${P.bgHeader}${P.lavender}${P.bold} ${B.diamond} ${roomId} ${P.reset}${P.bgHeader}  ${P.mint}${onlineCount} online${P.reset}${P.bgHeader}  ${dots}${P.bgHeader}`;
+    process.stdout.write(P.bgHeader + P.muted + B.v + P.reset + padRight(roomLine, cols - 2) + P.bgHeader + P.muted + B.v + P.reset);
+
+    // Member names
+    moveTo(3, 1);
+    const memberStr = members.map(m => {
+      const c = getNameColor(m.name);
+      return `${c}${m.name}${P.reset}`;
+    }).join(`${P.muted}, ${P.reset}`);
+    const memberLine = ` ${P.bgHeader} ${memberStr}${P.bgHeader}`;
+    process.stdout.write(P.bgHeader + P.muted + B.v + P.reset + padRight(memberLine, cols - 2) + P.bgHeader + P.muted + B.v + P.reset);
+
+    // ── MESSAGES ──
+    // Top separator
+    moveTo(headerH + 1, 1);
+    process.stdout.write(P.bgDark + P.muted + '├' + B.h.repeat(cols - 2) + '┤' + P.reset);
+
+    const msgStart = headerH + 2;
+    const visibleMsgs = messages.slice(-(msgH - 1));
+    for (let i = 0; i < msgH - 1; i++) {
+      moveTo(msgStart + i, 1);
+      if (i < visibleMsgs.length) {
+        const line = visibleMsgs[i];
+        const visible = stripAnsi(line);
+        const padded = visible.length < cols - 4 ? line + ' '.repeat(cols - 4 - visible.length) : line;
+        process.stdout.write(P.bgDark + P.muted + B.v + P.reset + P.bgDark + ' ' + padded + ' ' + P.muted + B.v + P.reset);
+      } else {
+        process.stdout.write(P.bgDark + P.muted + B.v + P.reset + P.bgDark + ' '.repeat(cols - 2) + P.muted + B.v + P.reset);
+      }
+    }
+
+    // ── INPUT ──
+    const inputTop = rows - inputH;
+
+    // Separator
+    moveTo(inputTop, 1);
+    process.stdout.write(P.bgDark + P.muted + '├' + B.h.repeat(cols - 2) + '┤' + P.reset);
+
+    // Input line
+    moveTo(inputTop + 1, 1);
+    const promptStr = `${P.mint}${P.bold} ${B.arrow} ${P.reset}${P.bgInput}`;
+    const inputDisplay = inputText.slice(0, cols - 6);
+    const inputLine = promptStr + P.cream + inputDisplay + P.reset + P.bgInput;
+    process.stdout.write(P.bgInput + P.muted + B.v + P.reset + padRight(inputLine, cols - 2) + P.bgInput + P.muted + B.v + P.reset);
+
+    // Bottom border
+    moveTo(inputTop + 2, 1);
+    process.stdout.write(P.bgDark + P.muted + B.bl + B.h.repeat(cols - 2) + B.br + P.reset);
+
+    // Position cursor in input
+    moveTo(inputTop + 1, 4 + cursorPos);
     process.stdout.write('\x1b[?25h');
   }
 
@@ -175,13 +237,19 @@ function runHumanMode() {
 
   function addChat(from, text, ts, isSelf) {
     const time = formatTime(ts);
-    const nameColor = isSelf ? C.cyan : C.yellow;
-    addMessage(`${C.gray}${time}${C.reset} ${nameColor}${C.bold}${from}${C.reset}: ${text}`);
+    const nameColor = isSelf ? P.mint : getNameColor(from);
+    addMessage(`${P.muted}${time}${P.reset} ${nameColor}${P.bold}${from}${P.reset}${P.muted}:${P.reset} ${P.cream}${text}${P.reset}`);
   }
 
   function addSystem(text, ts) {
     const time = ts ? formatTime(ts) + ' ' : '';
-    addMessage(`${C.gray}${time}— ${text}${C.reset}`);
+    // Determine icon based on event type
+    let icon = '○';
+    let color = P.muted;
+    if (text.includes('joined')) { icon = '→'; color = P.mint; }
+    else if (text.includes('left') || text.includes('Disconnected')) { icon = '←'; color = P.softRed; }
+    else if (text.includes('Joined as')) { icon = '✓'; color = P.mint; }
+    addMessage(`${P.muted}${time}${color} ${icon} ${text}${P.reset}`);
   }
 
   // ── WebSocket ──
@@ -199,12 +267,17 @@ function runHumanMode() {
         addChat(msg.from, msg.text, msg.timestamp, msg.fromId === myId);
         break;
       case 'system':
-        if (msg.text.includes('joined the room')) {
+        // Update member list properly
+        if (msg.text.endsWith('joined the room')) {
           const name = msg.text.replace(' joined the room', '');
-          if (!members.find(m => m.name === name)) members.push({ id: '?', name });
-        } else if (msg.text.includes('left the room')) {
+          if (!members.find(m => m.name === name)) {
+            members.push({ id: `dyn-${Date.now()}`, name });
+          }
+        } else if (msg.text.endsWith('left the room')) {
           const name = msg.text.replace(' left the room', '');
-          members = members.filter(m => m.name !== name);
+          // Remove ONE instance (in case of duplicate names)
+          const idx = members.findIndex(m => m.name === name);
+          if (idx !== -1) members.splice(idx, 1);
         }
         addSystem(msg.text, msg.timestamp);
         break;
@@ -213,22 +286,30 @@ function runHumanMode() {
         render();
         break;
       case 'error':
-        addMessage(`${C.red}✗ ${msg.text}${C.reset}`);
+        addMessage(`${P.softRed} ✗ ${msg.text}${P.reset}`);
         break;
     }
   });
 
   ws.on('close', () => {
     addSystem('Disconnected');
-    setTimeout(() => { process.stdout.write('\x1b[?25h\x1b[2J\x1b[H'); process.exit(0); }, 1000);
+    members = [];
+    render();
+    setTimeout(() => {
+      process.stdout.write('\x1b[?25h\x1b[0m\x1b[2J\x1b[H');
+      process.exit(0);
+    }, 2000);
   });
 
   ws.on('error', (err) => {
-    addMessage(`${C.red}Error: ${err.message}${C.reset}`);
-    setTimeout(() => { process.stdout.write('\x1b[?25h\x1b[2J\x1b[H'); process.exit(1); }, 1000);
+    addMessage(`${P.softRed} Connection error: ${err.message}${P.reset}`);
+    setTimeout(() => {
+      process.stdout.write('\x1b[?25h\x1b[0m\x1b[2J\x1b[H');
+      process.exit(1);
+    }, 2000);
   });
 
-  // ── Raw keyboard input ──
+  // ── Keyboard input ──
   process.stdin.setRawMode(true);
   process.stdin.resume();
   process.stdin.setEncoding('utf8');
@@ -237,8 +318,7 @@ function runHumanMode() {
     // Ctrl+C
     if (key === '\x03') {
       ws.close();
-      process.stdout.write('\x1b[?25h\x1b[2J\x1b[H');
-      process.exit(0);
+      return;
     }
 
     // Enter
@@ -265,32 +345,51 @@ function runHumanMode() {
       return;
     }
 
-    // Escape sequences (arrows etc)
-    if (key === '\x1b[D') { // Left
-      if (cursorPos > 0) cursorPos--;
+    // Delete
+    if (key === '\x1b[3~') {
+      if (cursorPos < inputText.length) {
+        inputText = inputText.slice(0, cursorPos) + inputText.slice(cursorPos + 1);
+      }
       render();
       return;
     }
-    if (key === '\x1b[D') { // Right  
-      if (cursorPos < inputText.length) cursorPos++;
+
+    // Arrow keys
+    if (key === '\x1b[D') { if (cursorPos > 0) cursorPos--; render(); return; }              // Left
+    if (key === '\x1b[C') { if (cursorPos < inputText.length) cursorPos++; render(); return; } // Right
+    if (key === '\x1b[A' || key === '\x1b[B') return; // Up/Down — ignore for now
+
+    // Home / End
+    if (key === '\x1b[H' || key === '\x01') { cursorPos = 0; render(); return; }                  // Home / Ctrl+A
+    if (key === '\x1b[F' || key === '\x05') { cursorPos = inputText.length; render(); return; }    // End / Ctrl+E
+
+    // Ctrl+U — clear input
+    if (key === '\x15') { inputText = ''; cursorPos = 0; render(); return; }
+
+    // Ctrl+W — delete word back
+    if (key === '\x17') {
+      const before = inputText.slice(0, cursorPos);
+      const after = inputText.slice(cursorPos);
+      const trimmed = before.replace(/\S+\s*$/, '');
+      cursorPos = trimmed.length;
+      inputText = trimmed + after;
       render();
       return;
     }
 
     // Escape alone — ignore
-    if (key === '\x1b') return;
+    if (key.startsWith('\x1b')) return;
 
-    // Regular character
-    if (key.length === 1 && key >= ' ') {
-      inputText = inputText.slice(0, cursorPos) + key + inputText.slice(cursorPos);
-      cursorPos++;
-      render();
+    // Regular characters (including pasted text)
+    for (const ch of key) {
+      if (ch >= ' ') {
+        inputText = inputText.slice(0, cursorPos) + ch + inputText.slice(cursorPos);
+        cursorPos++;
+      }
     }
+    render();
   });
 
-  // Handle resize
   process.stdout.on('resize', () => render());
-
-  // Initial render
   render();
 }
