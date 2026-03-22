@@ -1,6 +1,21 @@
 #!/usr/bin/env node
+/**
+ * Chatroom TUI — blessed-based terminal UI
+ * 
+ * ┌─ poker-table ── 3 online ──────────────────┐
+ * │ Decentraliser, Rick, Mando                  │
+ * ├─────────────────────────────────────────────┤
+ * │ 05:01 Decentraliser: yo                     │
+ * │ 05:01 Rick: wubba lubba dub dub             │
+ * │ 05:02 — Mando joined the room               │
+ * │ 05:02 Mando: This is the Way.               │
+ * │                                              │
+ * ├─────────────────────────────────────────────┤
+ * │ > Type a message...                          │
+ * └─────────────────────────────────────────────┘
+ */
 
-const readline = require('readline');
+const blessed = require('blessed');
 const WebSocket = require('ws');
 
 const args = process.argv.slice(2);
@@ -8,7 +23,6 @@ let serverUrl = 'ws://localhost:4000';
 let roomId = null;
 let userName = null;
 
-// Parse args: cli.js <room> [--name <name>] [--server <url>]
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--name' && args[i + 1]) {
     userName = args[++i];
@@ -28,20 +42,146 @@ if (!userName) {
   userName = `user-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const ws = new WebSocket(serverUrl);
+// ── State ──
+let myId = null;
+let members = [];
 
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  prompt: '',
+// ── Screen ──
+const screen = blessed.screen({
+  smartCSR: true,
+  title: `chatroom — ${roomId}`,
 });
 
+// ── Header: room info + members ──
+const header = blessed.box({
+  parent: screen,
+  top: 0,
+  left: 0,
+  width: '100%',
+  height: 3,
+  tags: true,
+  border: { type: 'line' },
+  style: {
+    border: { fg: 'cyan' },
+    fg: 'white',
+  },
+});
+
+function updateHeader() {
+  const memberList = members.map(m => m.name).join(', ') || '...';
+  header.setContent(
+    `{bold}{cyan-fg}${roomId}{/cyan-fg}{/bold}  {gray-fg}${members.length} online{/gray-fg}  │  ${memberList}`
+  );
+  screen.render();
+}
+updateHeader();
+
+// ── Messages area ──
+const messageBox = blessed.log({
+  parent: screen,
+  top: 3,
+  left: 0,
+  width: '100%',
+  height: '100%-6',
+  tags: true,
+  scrollable: true,
+  alwaysScroll: true,
+  scrollbar: {
+    style: { bg: 'cyan' },
+  },
+  border: { type: 'line' },
+  style: {
+    border: { fg: 'gray' },
+    fg: 'white',
+  },
+  mouse: true,
+});
+
+// ── Input box ──
+const inputBox = blessed.textbox({
+  parent: screen,
+  bottom: 0,
+  left: 0,
+  width: '100%',
+  height: 3,
+  border: { type: 'line' },
+  style: {
+    border: { fg: 'green' },
+    fg: 'white',
+  },
+  inputOnFocus: true,
+});
+
+// ── Helpers ──
 function formatTime(ts) {
   const d = new Date(ts);
-  return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' });
 }
 
+function addMessage(line) {
+  messageBox.log(line);
+  screen.render();
+}
+
+function addSystemMessage(text, ts) {
+  const time = ts ? formatTime(ts) : '';
+  addMessage(`{gray-fg}${time} — ${text}{/gray-fg}`);
+}
+
+function addChatMessage(from, text, ts, isSelf) {
+  const time = formatTime(ts);
+  const nameColor = isSelf ? 'cyan-fg' : 'yellow-fg';
+  addMessage(`{gray-fg}${time}{/gray-fg} {${nameColor}}{bold}${from}{/bold}{/${nameColor}}: ${text}`);
+}
+
+// ── Focus input ──
+function focusInput() {
+  inputBox.clearValue();
+  inputBox.focus();
+  screen.render();
+}
+
+// ── Input handling ──
+inputBox.on('submit', (value) => {
+  const text = (value || '').trim();
+  if (!text) {
+    focusInput();
+    return;
+  }
+
+  if (text === '/who') {
+    ws.send(JSON.stringify({ type: 'who' }));
+  } else if (text === '/quit' || text === '/exit') {
+    ws.close();
+    return;
+  } else if (text.startsWith('/clear')) {
+    messageBox.setContent('');
+  } else {
+    ws.send(JSON.stringify({ type: 'msg', text }));
+  }
+
+  focusInput();
+});
+
+inputBox.on('cancel', () => {
+  focusInput();
+});
+
+// ── Keys ──
+screen.key(['escape', 'C-c'], () => {
+  ws.close();
+  process.exit(0);
+});
+
+screen.key(['tab'], () => {
+  focusInput();
+});
+
+// ── WebSocket ──
+const ws = new WebSocket(serverUrl);
+
 ws.on('open', () => {
+  addSystemMessage('Connecting...');
   ws.send(JSON.stringify({ type: 'join', room: roomId, name: userName }));
 });
 
@@ -53,83 +193,58 @@ ws.on('message', (raw) => {
     return;
   }
 
-  // Clear current line, print message, restore prompt
-  readline.clearLine(process.stdout, 0);
-  readline.cursorTo(process.stdout, 0);
-
   switch (msg.type) {
     case 'joined':
-      console.log(`\x1b[32m✓ Joined room "${msg.room}" as ${msg.you.name}\x1b[0m`);
-      console.log(`\x1b[90m  Members: ${msg.members.map(m => m.name).join(', ')}\x1b[0m`);
+      myId = msg.you.id;
+      members = msg.members;
+      updateHeader();
+      addSystemMessage(`Joined as {bold}${msg.you.name}{/bold}`);
+      addSystemMessage(`Members: ${msg.members.map(m => m.name).join(', ')}`);
+      focusInput();
       break;
 
     case 'msg':
-      if (msg.fromId === myId) {
-        // Own message — already typed it, just show timestamp
-        console.log(`\x1b[90m${formatTime(msg.timestamp)}\x1b[0m \x1b[36m${msg.from}\x1b[0m: ${msg.text}`);
-      } else {
-        console.log(`\x1b[90m${formatTime(msg.timestamp)}\x1b[0m \x1b[33m${msg.from}\x1b[0m: ${msg.text}`);
-      }
+      addChatMessage(msg.from, msg.text, msg.timestamp, msg.fromId === myId);
       break;
 
     case 'system':
-      console.log(`\x1b[90m${formatTime(msg.timestamp)} — ${msg.text}\x1b[0m`);
+      // Update member list on join/leave
+      if (msg.text.includes('joined the room')) {
+        const name = msg.text.replace(' joined the room', '');
+        if (!members.find(m => m.name === name)) {
+          members.push({ id: '?', name });
+          updateHeader();
+        }
+      } else if (msg.text.includes('left the room')) {
+        const name = msg.text.replace(' left the room', '');
+        members = members.filter(m => m.name !== name);
+        updateHeader();
+      }
+      addSystemMessage(msg.text, msg.timestamp);
       break;
 
     case 'members':
-      console.log(`\x1b[90mRoom "${msg.room}": ${msg.members.map(m => m.name).join(', ')}\x1b[0m`);
+      members = msg.members;
+      updateHeader();
+      addSystemMessage(`Members: ${msg.members.map(m => m.name).join(', ')}`);
       break;
 
     case 'error':
-      console.log(`\x1b[31m✗ ${msg.text}\x1b[0m`);
+      addMessage(`{red-fg}✗ ${msg.text}{/red-fg}`);
       break;
   }
-
-  rl.prompt(true);
-});
-
-let myId = null;
-
-// Capture our ID from join response
-const origOn = ws.on.bind(ws);
-ws.on('message', (raw) => {
-  try {
-    const msg = JSON.parse(raw);
-    if (msg.type === 'joined' && msg.you) {
-      myId = msg.you.id;
-    }
-  } catch {}
 });
 
 ws.on('close', () => {
-  console.log('\x1b[31mDisconnected from server\x1b[0m');
-  process.exit(0);
+  addSystemMessage('Disconnected');
+  setTimeout(() => process.exit(0), 1000);
 });
 
 ws.on('error', (err) => {
-  console.error(`\x1b[31mConnection error: ${err.message}\x1b[0m`);
-  process.exit(1);
+  addMessage(`{red-fg}Connection error: ${err.message}{/red-fg}`);
+  setTimeout(() => process.exit(1), 1000);
 });
 
-rl.on('line', (line) => {
-  const text = line.trim();
-  if (!text) {
-    rl.prompt();
-    return;
-  }
-
-  if (text === '/who') {
-    ws.send(JSON.stringify({ type: 'who' }));
-  } else if (text === '/quit' || text === '/exit') {
-    ws.close();
-  } else {
-    ws.send(JSON.stringify({ type: 'msg', text }));
-  }
-
-  rl.prompt();
-});
-
-rl.on('close', () => {
-  ws.close();
-  process.exit(0);
-});
+// ── Start ──
+screen.render();
+focusInput();
