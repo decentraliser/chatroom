@@ -3,6 +3,7 @@ const { WebSocketServer } = require('ws');
 const { randomUUID } = require('crypto');
 
 const PORT = process.env.PORT || 4000;
+const PING_INTERVAL = 15000; // 15s ping to detect dead sockets
 
 // rooms: Map<roomId, Map<ws, { id, name, joinedAt }>>
 const rooms = new Map();
@@ -172,6 +173,28 @@ wss.on('connection', (ws) => {
     }
   });
 });
+
+// ── Ping/Pong heartbeat to detect dead sockets ──
+const alive = new WeakMap();
+
+wss.on('connection', (ws) => {
+  alive.set(ws, true);
+  ws.on('pong', () => alive.set(ws, true));
+});
+
+const pingTimer = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (alive.get(ws) === false) {
+      // Dead socket — terminate it (triggers 'close' event, which cleans up room)
+      ws.terminate();
+      continue;
+    }
+    alive.set(ws, false);
+    ws.ping();
+  }
+}, PING_INTERVAL);
+
+wss.on('close', () => clearInterval(pingTimer));
 
 server.listen(PORT, () => {
   console.log(`Chatroom server listening on ws://localhost:${PORT}`);
