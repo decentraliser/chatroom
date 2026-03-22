@@ -122,7 +122,6 @@ function runTuiMode() {
   const screen = blessed.screen({
     smartCSR: true,
     title: `chatroom — ${roomId}`,
-    fullUnicode: true,
   });
 
   // ── Header ──
@@ -141,12 +140,9 @@ function runTuiMode() {
   });
 
   function updateHeader() {
-    const memberNames = members.map(m => {
-      if (m.id === myId) return `{bold}{cyan-fg}${m.name}{/cyan-fg}{/bold}`;
-      return m.name;
-    }).join(', ') || '...';
+    const names = members.map(m => m.name).join(', ') || '...';
     header.setContent(
-      `{bold}{cyan-fg}#${roomId}{/cyan-fg}{/bold}  {gray-fg}│{/gray-fg}  {green-fg}${members.length} online{/green-fg}  {gray-fg}│{/gray-fg}  ${memberNames}`
+      `{bold}{cyan-fg}#${roomId}{/}  |  {green-fg}${members.length} online{/}  |  ${names}`
     );
     screen.render();
   }
@@ -222,13 +218,16 @@ function runTuiMode() {
 
   function addSystem(text, ts) {
     const time = ts ? formatTime(ts) + ' ' : '';
-    addMsg(`  {gray-fg}${time}— ${text}{/gray-fg}`);
+    addMsg(`{gray-fg}${time}-- ${text}{/}`);
   }
 
   function addChat(from, text, ts, isSelf) {
     const time = formatTime(ts);
-    const color = isSelf ? 'cyan-fg' : 'yellow-fg';
-    addMsg(`  {gray-fg}${time}{/gray-fg}  {${color}}{bold}${from}{/bold}{/${color}}  ${text}`);
+    if (isSelf) {
+      addMsg(`{gray-fg}${time}{/} {cyan-fg}${from}{/}: ${text}`);
+    } else {
+      addMsg(`{gray-fg}${time}{/} {yellow-fg}${from}{/}: ${text}`);
+    }
   }
 
   function focusInput() {
@@ -278,7 +277,7 @@ function runTuiMode() {
         myId = msg.you.id;
         members = msg.members;
         updateHeader();
-        addSystem(`Joined as {bold}${msg.you.name}{/bold}`);
+        addSystem(`Joined as ${msg.you.name}`);
         focusInput();
         break;
 
