@@ -1,0 +1,121 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body, #root { width: 100vw; height: 100vh; overflow: hidden; background: #1a1a2e; }
+
+/* ── Room layout: chat left, 3D right ── */
+.room-layout {
+  display: flex; width: 100vw; height: 100vh;
+}
+
+.chat-panel {
+  width: 380px; min-width: 320px; max-width: 420px;
+  height: 100vh; display: flex; flex-direction: column;
+  background: #14142a; border-right: 1px solid #2a2a44;
+  font-family: 'Courier New', monospace;
+  z-index: 10;
+}
+
+.chat-header {
+  padding: 16px 18px 12px; border-bottom: 1px solid #2a2a44;
+  flex-shrink: 0;
+}
+.chat-header .back-link {
+  color: #667788; text-decoration: none; font-size: 0.75rem;
+  display: block; margin-bottom: 6px;
+}
+.chat-header .back-link:hover { color: #88ddff; }
+.chat-header .room-name {
+  font-size: 1.3rem; font-weight: bold; color: #eeddcc;
+  display: block; margin-bottom: 10px;
+}
+.member-pills {
+  display: flex; flex-wrap: wrap; gap: 6px;
+}
+.member-pills span {
+  font-size: 0.7rem; color: #88aacc; padding: 2px 8px;
+  background: #1e1e38; border: 1px solid #2a2a44; border-radius: 10px;
+}
+.member-pills span.me { color: #ffcc55; border-color: #ffcc5544; }
+.member-pills span.disconnected { color: #ff5544; border-color: #ff554444; }
+
+.message-log {
+  flex: 1; overflow-y: auto; padding: 14px 18px;
+}
+.message-log::-webkit-scrollbar { width: 4px; }
+.message-log::-webkit-scrollbar-track { background: transparent; }
+.message-log::-webkit-scrollbar-thumb { background: #33446666; border-radius: 2px; }
+
+.msg-entry {
+  font-size: 0.9rem; padding: 5px 0; line-height: 1.45;
+  animation: fadeIn 0.3s ease-in;
+}
+.msg-entry .sender {
+  font-weight: bold; margin-right: 6px;
+}
+.msg-entry .sender::after { content: ':'; }
+.msg-entry .msg-text { color: #ccddee; }
+.msg-entry .system-text { color: #556677; font-style: italic; font-size: 0.8rem; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.chat-input {
+  padding: 12px 14px; border-top: 1px solid #2a2a44;
+  display: flex; gap: 8px; flex-shrink: 0;
+}
+.chat-input input {
+  background: #1a1a30; border: 1px solid #334466; color: #ccddee;
+  padding: 10px 12px; font-size: 0.9rem; font-family: 'Courier New', monospace;
+  outline: none; flex: 1; border-radius: 6px;
+}
+.chat-input input:focus { border-color: #88ddff; box-shadow: 0 0 6px #88ddff22; }
+.chat-input input::placeholder { color: #44556688; }
+.chat-input button {
+  background: #1a1a30; border: 1px solid #334466; color: #88ddff;
+  padding: 8px 14px; cursor: pointer; font-family: 'Courier New', monospace;
+  border-radius: 6px; font-size: 1rem;
+}
+.chat-input button:hover { background: #88ddff15; border-color: #88ddff; }
+
+.scene-container {
+  flex: 1; height: 100vh; position: relative;
+}
+
+/* ── Lobby ── */
+@keyframes shimmer {
+  0% { background-position: 0% center; }
+  100% { background-position: 200% center; }
+}
+
+.lobby {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  height: 100vh; gap: 20px; color: #ccddee; font-family: 'Courier New', monospace;
+  background: #1a1a2e;
+}
+.lobby h1 {
+  font-size: 3rem;
+  background: linear-gradient(90deg, #88ddff, #ffaa55, #88ddff);
+  background-size: 300% auto;
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  animation: shimmer 2s linear infinite;
+}
+.lobby input {
+  background: transparent; border: 1px solid #445566; color: #88ddff;
+  padding: 12px 20px; font-size: 1.2rem; font-family: inherit;
+  text-align: center; outline: none; border-radius: 4px;
+}
+.lobby input::placeholder { color: #44556688; }
+.lobby input:focus { border-color: #88ddff; box-shadow: 0 0 12px #88ddff33; }
+.lobby button {
+  background: transparent; border: 1px solid #88ddff; color: #88ddff;
+  padding: 10px 30px; font-size: 1rem; font-family: inherit; cursor: pointer;
+  border-radius: 4px;
+}
+.lobby button:hover { background: #88ddff15; }
+.lobby .rooms-list { text-align: center; }
+.lobby .rooms-list h3 { color: #ffaa55; margin-bottom: 8px; font-size: 0.9rem; }
+.lobby .rooms-list a {
+  display: block; color: #88ddff; text-decoration: none; padding: 4px; font-size: 0.85rem;
+}
+.lobby .rooms-list a:hover { color: #ffaa55; }

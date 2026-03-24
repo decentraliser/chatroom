@@ -27,6 +27,16 @@ if (!roomId) {
 }
 if (!userName) userName = `user-${Math.random().toString(36).slice(2, 8)}`;
 
+// Close the WebSocket cleanly when the process is killed (sandbox teardown, SIGTERM, etc.)
+function setupGracefulShutdown(ws) {
+  function shutdown() {
+    if (ws.readyState <= WebSocket.OPEN) ws.close();
+    setTimeout(() => process.exit(0), 500).unref();
+  }
+  for (const sig of ['SIGTERM', 'SIGHUP', 'SIGINT']) process.on(sig, shutdown);
+  process.on('beforeExit', shutdown);
+}
+
 if (!process.stdin.isTTY || agentMode) runAgentMode();
 else runHumanMode();
 
@@ -34,20 +44,63 @@ else runHumanMode();
 //  AGENT MODE
 // ═══════════════════════════════════════════════════════
 function runAgentMode() {
-  const ws = new WebSocket(serverUrl);
-  ws.on('open', () => ws.send(JSON.stringify({ type: 'join', room: roomId, name: userName })));
-  ws.on('message', (raw) => {
-    let msg; try { msg = JSON.parse(raw); } catch { return; }
-    switch (msg.type) {
-      case 'joined': process.stdout.write(`[JOINED] room=${msg.room} name=${msg.you.name} members=${msg.members.map(m=>m.name).join(',')}\n`); break;
-      case 'msg': process.stdout.write(`[MSG] ${msg.from}: ${msg.text}\n`); break;
-      case 'system': process.stdout.write(`[SYS] ${msg.text}\n`); break;
-      case 'members': process.stdout.write(`[MEMBERS] ${msg.members.map(m=>m.name).join(', ')}\n`); break;
-      case 'error': process.stdout.write(`[ERROR] ${msg.text}\n`); break;
+  let ws = null;
+  let shuttingDown = false;
+  const reconnectMs = 1200;
+  const outbox = [];
+
+  function sendOrQueue(line) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'msg', text: line }));
+    } else {
+      outbox.push(line);
+      process.stdout.write('[INFO] queued message while reconnecting\n');
     }
-  });
-  ws.on('close', () => { process.stdout.write('[DISCONNECTED]\n'); process.exit(0); });
-  ws.on('error', (err) => { process.stderr.write(`[ERROR] ${err.message}\n`); process.exit(1); });
+  }
+
+  function flushOutbox() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    while (outbox.length > 0) {
+      const line = outbox.shift();
+      ws.send(JSON.stringify({ type: 'msg', text: line }));
+    }
+  }
+
+  function connect() {
+    if (shuttingDown) return;
+    ws = new WebSocket(serverUrl);
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ type: 'join', room: roomId, name: userName }));
+      flushOutbox();
+    });
+    ws.on('message', (raw) => {
+      let msg; try { msg = JSON.parse(raw); } catch { return; }
+      switch (msg.type) {
+        case 'joined': process.stdout.write(`[JOINED] room=${msg.room} name=${msg.you.name} members=${msg.members.map(m=>m.name).join(',')}\n`); break;
+        case 'msg': process.stdout.write(`[MSG] ${msg.from}: ${msg.text}\n`); break;
+        case 'system': process.stdout.write(`[SYS] ${msg.text}\n`); break;
+        case 'members': process.stdout.write(`[MEMBERS] ${msg.members.map(m=>m.name).join(', ')}\n`); break;
+        case 'error': process.stdout.write(`[ERROR] ${msg.text}\n`); break;
+      }
+    });
+    ws.on('close', () => {
+      process.stdout.write('[DISCONNECTED]\n');
+      if (!shuttingDown) setTimeout(connect, reconnectMs);
+    });
+    ws.on('error', (err) => {
+      process.stderr.write(`[ERROR] ${err.message}\n`);
+    });
+  }
+
+  function shutdown() {
+    shuttingDown = true;
+    if (ws && ws.readyState <= WebSocket.OPEN) ws.close();
+    setTimeout(() => process.exit(0), 500).unref();
+  }
+
+  for (const sig of ['SIGTERM', 'SIGHUP', 'SIGINT']) process.on(sig, shutdown);
+
+  connect();
 
   let buf = '';
   process.stdin.setEncoding('utf8');
@@ -59,9 +112,13 @@ function runAgentMode() {
     buf = lines.pop() || '';
     for (const l of lines) {
       const t = l.trim(); if (!t) continue;
-      if (t === '/who') ws.send(JSON.stringify({ type: 'who' }));
-      else if (t === '/quit') ws.close();
-      else ws.send(JSON.stringify({ type: 'msg', text: t }));
+      if (t === '/who') {
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'who' }));
+      } else if (t === '/quit') {
+        shutdown();
+      } else {
+        sendOrQueue(t);
+      }
     }
   });
 }
@@ -71,6 +128,7 @@ function runAgentMode() {
 // ═══════════════════════════════════════════════════════
 function runHumanMode() {
   const ws = new WebSocket(serverUrl);
+  setupGracefulShutdown(ws);
 
   let myId = null;
   let members = [];
@@ -147,6 +205,33 @@ function runHumanMode() {
     process.stdout.write(`\x1b[${row};${col}H`);
   }
 
+  function renderInputArea() {
+    const { cols, rows } = getSize();
+    const inputH = 3;
+    const inputTop = rows - inputH;
+
+    process.stdout.write('\x1b[?25l'); // hide cursor
+
+    // Separator
+    moveTo(inputTop, 1);
+    process.stdout.write(P.bgDark + P.muted + '├' + B.h.repeat(cols - 2) + '┤' + P.reset);
+
+    // Input line
+    moveTo(inputTop + 1, 1);
+    const promptStr = `${P.mint}${P.bold} ${B.arrow} ${P.reset}${P.bgInput}`;
+    const inputDisplay = inputText.slice(0, cols - 6);
+    const inputLine = promptStr + P.cream + inputDisplay + P.reset + P.bgInput;
+    process.stdout.write(P.bgInput + P.muted + B.v + P.reset + padRight(inputLine, cols - 2) + P.bgInput + P.muted + B.v + P.reset);
+
+    // Bottom border
+    moveTo(inputTop + 2, 1);
+    process.stdout.write(P.bgDark + P.muted + B.bl + B.h.repeat(cols - 2) + B.br + P.reset);
+
+    // Position cursor in input
+    moveTo(inputTop + 1, 4 + cursorPos);
+    process.stdout.write('\x1b[?25h');
+  }
+
   function render() {
     const { cols, rows } = getSize();
 
@@ -208,26 +293,7 @@ function runHumanMode() {
     }
 
     // ── INPUT ──
-    const inputTop = rows - inputH;
-
-    // Separator
-    moveTo(inputTop, 1);
-    process.stdout.write(P.bgDark + P.muted + '├' + B.h.repeat(cols - 2) + '┤' + P.reset);
-
-    // Input line
-    moveTo(inputTop + 1, 1);
-    const promptStr = `${P.mint}${P.bold} ${B.arrow} ${P.reset}${P.bgInput}`;
-    const inputDisplay = inputText.slice(0, cols - 6);
-    const inputLine = promptStr + P.cream + inputDisplay + P.reset + P.bgInput;
-    process.stdout.write(P.bgInput + P.muted + B.v + P.reset + padRight(inputLine, cols - 2) + P.bgInput + P.muted + B.v + P.reset);
-
-    // Bottom border
-    moveTo(inputTop + 2, 1);
-    process.stdout.write(P.bgDark + P.muted + B.bl + B.h.repeat(cols - 2) + B.br + P.reset);
-
-    // Position cursor in input
-    moveTo(inputTop + 1, 4 + cursorPos);
-    process.stdout.write('\x1b[?25h');
+    renderInputArea();
   }
 
   function addMessage(formatted) {
@@ -327,7 +393,7 @@ function runHumanMode() {
       const text = inputText.trim();
       inputText = '';
       cursorPos = 0;
-      if (!text) { render(); return; }
+      if (!text) { renderInputArea(); return; }
       if (text === '/who') ws.send(JSON.stringify({ type: 'who' }));
       else if (text === '/quit') { ws.close(); return; }
       else if (text === '/clear') { messages = []; render(); return; }
@@ -342,7 +408,7 @@ function runHumanMode() {
         inputText = inputText.slice(0, cursorPos - 1) + inputText.slice(cursorPos);
         cursorPos--;
       }
-      render();
+      renderInputArea();
       return;
     }
 
@@ -351,21 +417,21 @@ function runHumanMode() {
       if (cursorPos < inputText.length) {
         inputText = inputText.slice(0, cursorPos) + inputText.slice(cursorPos + 1);
       }
-      render();
+      renderInputArea();
       return;
     }
 
     // Arrow keys
-    if (key === '\x1b[D') { if (cursorPos > 0) cursorPos--; render(); return; }              // Left
-    if (key === '\x1b[C') { if (cursorPos < inputText.length) cursorPos++; render(); return; } // Right
+    if (key === '\x1b[D') { if (cursorPos > 0) cursorPos--; renderInputArea(); return; }              // Left
+    if (key === '\x1b[C') { if (cursorPos < inputText.length) cursorPos++; renderInputArea(); return; } // Right
     if (key === '\x1b[A' || key === '\x1b[B') return; // Up/Down — ignore for now
 
     // Home / End
-    if (key === '\x1b[H' || key === '\x01') { cursorPos = 0; render(); return; }                  // Home / Ctrl+A
-    if (key === '\x1b[F' || key === '\x05') { cursorPos = inputText.length; render(); return; }    // End / Ctrl+E
+    if (key === '\x1b[H' || key === '\x01') { cursorPos = 0; renderInputArea(); return; }                  // Home / Ctrl+A
+    if (key === '\x1b[F' || key === '\x05') { cursorPos = inputText.length; renderInputArea(); return; }    // End / Ctrl+E
 
     // Ctrl+U — clear input
-    if (key === '\x15') { inputText = ''; cursorPos = 0; render(); return; }
+    if (key === '\x15') { inputText = ''; cursorPos = 0; renderInputArea(); return; }
 
     // Ctrl+W — delete word back
     if (key === '\x17') {
@@ -374,7 +440,7 @@ function runHumanMode() {
       const trimmed = before.replace(/\S+\s*$/, '');
       cursorPos = trimmed.length;
       inputText = trimmed + after;
-      render();
+      renderInputArea();
       return;
     }
 
@@ -388,7 +454,7 @@ function runHumanMode() {
         cursorPos++;
       }
     }
-    render();
+    renderInputArea();
   });
 
   process.stdout.on('resize', () => render());

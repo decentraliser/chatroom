@@ -1,9 +1,16 @@
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const { randomUUID } = require('crypto');
+const fs = require('fs');
+const pathMod = require('path');
+
+const ARTIFACT_BASE = pathMod.join('/tmp', 'chatroom-artifacts');
 
 const PORT = process.env.PORT || 4000;
-const PING_INTERVAL = 15000; // 15s ping to detect dead sockets
+const PING_INTERVAL  = 30_000;        // 30s — detect dead TCP connections
+const PING_TIMEOUT   = 10_000;        // 10s pong deadline
+const IDLE_TIMEOUT   = 60 * 60_000;   // 1h — evict if no messages sent
+const IDLE_SWEEP     = 60_000;        // check for idle connections every 60s
 
 // rooms: Map<roomId, Map<ws, { id, name, joinedAt }>>
 const rooms = new Map();
@@ -37,7 +44,10 @@ const server = http.createServer((req, res) => {
     for (const [roomId, members] of rooms) {
       list.push({
         id: roomId,
-        members: Array.from(members.values()).map(m => ({ id: m.id, name: m.name })),
+        members: Array.from(members.values()).map(m => ({
+          id: m.id, name: m.name,
+          idleSince: Math.round((Date.now() - m.lastActivity) / 1000),
+        })),
         count: members.size,
       });
     }
@@ -45,6 +55,47 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(list));
     return;
   }
+  // GET /rooms/:roomId/artifacts — list all artifacts for a room
+  // GET /rooms/:roomId/artifacts/:name — get a specific artifact
+  const artifactMatch = req.url.match(/^\/rooms\/([^/]+)\/artifacts(?:\/([^/]+))?$/);
+  if (artifactMatch && req.method === 'GET') {
+    const roomId = decodeURIComponent(artifactMatch[1]);
+    const name = artifactMatch[2] ? decodeURIComponent(artifactMatch[2]) : null;
+    const roomDir = pathMod.join(ARTIFACT_BASE, roomId);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+
+    if (!name) {
+      // List all artifacts
+      try {
+        const files = fs.readdirSync(roomDir);
+        const result = {};
+        for (const f of files) {
+          try {
+            result[f] = fs.readFileSync(pathMod.join(roomDir, f), 'utf8');
+          } catch {}
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      } catch {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+      }
+    } else {
+      // Get specific artifact
+      const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const filepath = pathMod.join(roomDir, safeName);
+      try {
+        const content = fs.readFileSync(filepath, 'utf8');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(content);
+      } catch {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'not found' }));
+      }
+    }
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
@@ -88,7 +139,7 @@ wss.on('connection', (ws) => {
         }
 
         currentRoom = roomId;
-        userInfo = { id: randomUUID(), name, joinedAt: Date.now() };
+        userInfo = { id: randomUUID(), name, joinedAt: Date.now(), lastActivity: Date.now() };
         const room = getRoom(roomId);
         room.set(ws, userInfo);
 
@@ -100,11 +151,16 @@ wss.on('connection', (ws) => {
           members: Array.from(room.values()).map(m => ({ id: m.id, name: m.name })),
         }));
 
-        // Announce to others
+        // Announce to others and push updated member list
         broadcast(roomId, {
           type: 'system',
           text: `${name} joined the room`,
           timestamp: Date.now(),
+        }, ws);
+        broadcast(roomId, {
+          type: 'members',
+          room: roomId,
+          members: Array.from(room.values()).map(m => ({ id: m.id, name: m.name })),
         }, ws);
 
         break;
@@ -115,6 +171,7 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'error', text: 'Join a room first' }));
           return;
         }
+        userInfo.lastActivity = Date.now();
         const text = (msg.text || '').trim();
         if (!text) return;
 
@@ -144,6 +201,7 @@ wss.on('connection', (ws) => {
           ws.send(JSON.stringify({ type: 'error', text: 'Not in a room' }));
           return;
         }
+        if (userInfo) userInfo.lastActivity = Date.now();
         const room = rooms.get(currentRoom);
         ws.send(JSON.stringify({
           type: 'members',
@@ -168,33 +226,62 @@ wss.on('connection', (ws) => {
           text: `${userInfo.name} left the room`,
           timestamp: Date.now(),
         });
-        if (room.size === 0) rooms.delete(currentRoom);
+        // Push authoritative member list so all clients stay in sync
+        if (room.size > 0) {
+          broadcast(currentRoom, {
+            type: 'members',
+            room: currentRoom,
+            members: Array.from(room.values()).map(m => ({ id: m.id, name: m.name })),
+          });
+        } else {
+          rooms.delete(currentRoom);
+        }
       }
     }
   });
 });
 
-// ── Ping/Pong heartbeat to detect dead sockets ──
-const alive = new WeakMap();
-
+// ── Ping/Pong heartbeat — detects dead TCP connections ──
 wss.on('connection', (ws) => {
-  alive.set(ws, true);
-  ws.on('pong', () => alive.set(ws, true));
+  let pongTimer = null;
+
+  function schedulePing() {
+    const t = setTimeout(() => {
+      pongTimer = setTimeout(() => ws.terminate(), PING_TIMEOUT);
+      ws.ping();
+    }, PING_INTERVAL);
+    t.unref();
+    return t;
+  }
+
+  let pingTimer = schedulePing();
+
+  ws.on('pong', () => {
+    if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
+    clearTimeout(pingTimer);
+    pingTimer = schedulePing();
+  });
+
+  ws.on('close', () => {
+    clearTimeout(pingTimer);
+    if (pongTimer) clearTimeout(pongTimer);
+  });
 });
 
-const pingTimer = setInterval(() => {
-  for (const ws of wss.clients) {
-    if (alive.get(ws) === false) {
-      // Dead socket — terminate it (triggers 'close' event, which cleans up room)
-      ws.terminate();
-      continue;
+// ── Idle sweep — evict connections with no messages for IDLE_TIMEOUT ──
+const idleTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [roomId, members] of rooms) {
+    for (const [ws, info] of members) {
+      if (now - info.lastActivity > IDLE_TIMEOUT) {
+        // Notify and terminate
+        try { ws.send(JSON.stringify({ type: 'system', text: 'Disconnected due to inactivity', timestamp: now })); } catch {}
+        ws.terminate();
+      }
     }
-    alive.set(ws, false);
-    ws.ping();
   }
-}, PING_INTERVAL);
-
-wss.on('close', () => clearInterval(pingTimer));
+}, IDLE_SWEEP);
+idleTimer.unref();
 
 server.listen(PORT, () => {
   console.log(`Chatroom server listening on ws://localhost:${PORT}`);
